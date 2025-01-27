@@ -18,11 +18,10 @@ const (
 
 var fuzzingTestCases = []TestCaseInfo{
 	{Path: "fuzz/fuzz-mode.yaml", TestCase: &fuzzModeOverride{}},
+	{Path: "fuzz/fuzz-multi-mode.yaml", TestCase: &fuzzMultipleMode{}},
 	{Path: "fuzz/fuzz-type.yaml", TestCase: &fuzzTypeOverride{}},
 	{Path: "fuzz/fuzz-query.yaml", TestCase: &httpFuzzQuery{}},
 	{Path: "fuzz/fuzz-headless.yaml", TestCase: &HeadlessFuzzingQuery{}},
-	{Path: "fuzz/fuzz-header-basic.yaml", TestCase: &FuzzHeaderBasic{}},
-	{Path: "fuzz/fuzz-header-multiple.yaml", TestCase: &FuzzHeaderMultiple{}},
 	// for fuzzing we should prioritize adding test case related backend
 	// logic in fuzz playground server instead of adding them here
 	{Path: "fuzz/fuzz-query-num-replace.yaml", TestCase: &genericFuzzTestCase{expectedResults: 2}},
@@ -177,49 +176,26 @@ func (h *HeadlessFuzzingQuery) Execute(filePath string) error {
 	return expectResultsCount(got, 2)
 }
 
-type FuzzHeaderBasic struct{}
+type fuzzMultipleMode struct{}
 
 // Execute executes a test case and returns an error if occurred
-func (h *FuzzHeaderBasic) Execute(filePath string) error {
+func (h *fuzzMultipleMode) Execute(filePath string) error {
 	router := httprouter.New()
 	router.GET("/", func(w http.ResponseWriter, r *http.Request, _ httprouter.Params) {
-		host := r.Header.Get("Origin")
-		// redirect to different domain
-		w.WriteHeader(http.StatusOK)
-		fmt.Fprintf(w, "<html><body><a href="+host+">Click Here</a></body></html>")
-	})
-	ts := httptest.NewTLSServer(router)
-	defer ts.Close()
-
-	got, err := testutils.RunNucleiTemplateAndGetResults(filePath, ts.URL, debug, "-fuzz")
-	if err != nil {
-		return err
-	}
-	return expectResultsCount(got, 1)
-}
-
-type FuzzHeaderMultiple struct{}
-
-// Execute executes a test case and returns an error if occurred
-func (h *FuzzHeaderMultiple) Execute(filePath string) error {
-	router := httprouter.New()
-	router.GET("/", func(w http.ResponseWriter, r *http.Request, _ httprouter.Params) {
-		host1 := r.Header.Get("Origin")
-		host2 := r.Header.Get("X-Forwared-For")
-
-		fmt.Printf("host1: %s, host2: %s\n", host1, host2)
-		if host1 == host2 && host2 == "secret.local" {
-			w.WriteHeader(http.StatusOK)
-			fmt.Fprintf(w, "welcome! to secret admin panel")
+		xClientId := r.Header.Get("X-Client-Id")
+		xSecretId := r.Header.Get("X-Secret-Id")
+		if xClientId != "nuclei-v3" || xSecretId != "nuclei-v3" {
+			w.WriteHeader(http.StatusUnauthorized)
 			return
 		}
-		// redirect to different domain
-		w.WriteHeader(http.StatusForbidden)
+		w.Header().Set("Content-Type", "text/html")
+		resp := fmt.Sprintf("<html><body><h1>This is multi-mode fuzzing test: %v <h1></body></html>", xClientId)
+		fmt.Fprint(w, resp)
 	})
 	ts := httptest.NewTLSServer(router)
 	defer ts.Close()
 
-	got, err := testutils.RunNucleiTemplateAndGetResults(filePath, ts.URL, debug, "-fuzz")
+	got, err := testutils.RunNucleiTemplateAndGetResults(filePath, ts.URL+"?url=https://scanme.sh", debug, "-jsonl", "-fuzz")
 	if err != nil {
 		return err
 	}

@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"net"
 	"net/url"
+	"sync"
 
 	"github.com/go-sql-driver/mysql"
 	"github.com/pkg/errors"
@@ -19,8 +20,20 @@ import (
 
 // Dialer is a shared fastdialer instance for host DNS resolution
 var (
-	Dialer *fastdialer.Dialer
+	muDialer sync.RWMutex
+	Dialer   *fastdialer.Dialer
 )
+
+func GetDialer() *fastdialer.Dialer {
+	muDialer.RLock()
+	defer muDialer.RUnlock()
+
+	return Dialer
+}
+
+func ShouldInit() bool {
+	return Dialer == nil
+}
 
 // Init creates the Dialer instance based on user configuration
 func Init(options *types.Options) error {
@@ -30,9 +43,7 @@ func Init(options *types.Options) error {
 
 	lfaAllowed = options.AllowLocalFileAccess
 	opts := fastdialer.DefaultOptions
-	if options.DialerTimeout > 0 {
-		opts.DialerTimeout = options.DialerTimeout
-	}
+	opts.DialerTimeout = options.GetTimeouts().DialTimeout
 	if options.DialerKeepAlive > 0 {
 		opts.DialerKeepAlive = options.DialerKeepAlive
 	}
@@ -98,8 +109,8 @@ func Init(options *types.Options) error {
 			},
 		}
 	}
-	if types.ProxySocksURL != "" {
-		proxyURL, err := url.Parse(types.ProxySocksURL)
+	if options.AliveSocksProxy != "" {
+		proxyURL, err := url.Parse(options.AliveSocksProxy)
 		if err != nil {
 			return err
 		}
@@ -124,7 +135,7 @@ func Init(options *types.Options) error {
 		opts.ResolversFile = true
 		opts.EnableFallback = true
 	}
-	if options.ResolversFile != "" {
+	if len(options.InternalResolversList) > 0 {
 		opts.BaseResolvers = options.InternalResolversList
 	}
 
@@ -132,6 +143,9 @@ func Init(options *types.Options) error {
 
 	opts.WithDialerHistory = true
 	opts.SNIName = options.SNI
+	// this instance is used in javascript protocol libraries and
+	// dial history is required to get dialed ip of a host
+	opts.WithDialerHistory = true
 
 	// fastdialer now by default fallbacks to ztls when there are tls related errors
 	dialer, err := fastdialer.NewDialer(opts)
@@ -140,12 +154,20 @@ func Init(options *types.Options) error {
 	}
 	Dialer = dialer
 
-	// override dialer in mysql
-	mysql.RegisterDialContext("tcp", func(ctx context.Context, addr string) (net.Conn, error) {
+	// Set a custom dialer for the "nucleitcp" protocol.  This is just plain TCP, but it's registered
+	// with a different name so that we do not clobber the "tcp" dialer in the event that nuclei is
+	// being included as a package in another application.
+	mysql.RegisterDialContext("nucleitcp", func(ctx context.Context, addr string) (net.Conn, error) {
+		// Because we're not using the default TCP workflow, quietly add the default port
+		// number if no port number was specified.
+		if _, _, err := net.SplitHostPort(addr); err != nil {
+			addr += ":3306"
+		}
+
 		return Dialer.Dial(ctx, "tcp", addr)
 	})
 
-	StartActiveMemGuardian()
+	StartActiveMemGuardian(context.Background())
 
 	return nil
 }
@@ -177,6 +199,7 @@ func interfaceAddress(interfaceName string) (net.IP, error) {
 		if ipnet, ok := addr.(*net.IPNet); ok && !ipnet.IP.IsLoopback() {
 			if ipnet.IP.To4() != nil {
 				address = ipnet.IP
+				break
 			}
 		}
 	}
@@ -204,8 +227,12 @@ func interfaceAddresses(interfaceName string) ([]net.Addr, error) {
 
 // Close closes the global shared fastdialer
 func Close() {
+	muDialer.Lock()
+	defer muDialer.Unlock()
+
 	if Dialer != nil {
 		Dialer.Close()
+		Dialer = nil
 	}
 	StopActiveMemGuardian()
 }

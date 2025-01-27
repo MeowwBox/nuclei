@@ -23,6 +23,7 @@ import (
 	logutil "github.com/projectdiscovery/utils/log"
 	sliceutil "github.com/projectdiscovery/utils/slice"
 	stringsutil "github.com/projectdiscovery/utils/strings"
+	unitutils "github.com/projectdiscovery/utils/unit"
 )
 
 var httpTestcases = []TestCaseInfo{
@@ -82,6 +83,8 @@ var httpTestcases = []TestCaseInfo{
 	{Path: "protocols/http/multi-request.yaml", TestCase: &httpMultiRequest{}},
 	{Path: "protocols/http/http-matcher-extractor-dy-extractor.yaml", TestCase: &httpMatcherExtractorDynamicExtractor{}},
 	{Path: "protocols/http/multi-http-var-sharing.yaml", TestCase: &httpMultiVarSharing{}},
+	{Path: "protocols/http/raw-path-single-slash.yaml", TestCase: &httpRawPathSingleSlash{}},
+	{Path: "protocols/http/raw-unsafe-path-single-slash.yaml", TestCase: &httpRawUnsafePathSingleSlash{}},
 }
 
 type httpMultiVarSharing struct{}
@@ -152,7 +155,7 @@ func (h *httpInteractshRequest) Execute(filePath string) error {
 		return err
 	}
 
-	return expectResultsCount(results, 1)
+	return expectResultsCount(results, 1, 2)
 }
 
 type httpDefaultMatcherCondition struct{}
@@ -507,7 +510,7 @@ func (h *httpPostMultipartBody) Execute(filePath string) error {
 	var routerErr error
 
 	router.POST("/", func(w http.ResponseWriter, r *http.Request, _ httprouter.Params) {
-		if err := r.ParseMultipartForm(1 * 1024); err != nil {
+		if err := r.ParseMultipartForm(unitutils.Mega); err != nil {
 			routerErr = err
 			return
 		}
@@ -949,7 +952,7 @@ func (h *httpRequestSelfContained) Execute(filePath string) error {
 	}()
 	defer server.Close()
 
-	results, err := testutils.RunNucleiTemplateAndGetResults(filePath, "", debug)
+	results, err := testutils.RunNucleiTemplateAndGetResults(filePath, "", debug, "-esc")
 	if err != nil {
 		return err
 	}
@@ -985,7 +988,7 @@ func (h *httpRequestSelfContainedWithParams) Execute(filePath string) error {
 	}()
 	defer server.Close()
 
-	results, err := testutils.RunNucleiTemplateAndGetResults(filePath, "", debug)
+	results, err := testutils.RunNucleiTemplateAndGetResults(filePath, "", debug, "-esc")
 	if err != nil {
 		return err
 	}
@@ -1028,7 +1031,7 @@ func (h *httpRequestSelfContainedFileInput) Execute(filePath string) error {
 	}
 	defer FileLoc.Close()
 
-	results, err := testutils.RunNucleiTemplateAndGetResults(filePath, "", debug, "-V", "test="+FileLoc.Name())
+	results, err := testutils.RunNucleiTemplateAndGetResults(filePath, "", debug, "-V", "test="+FileLoc.Name(), "-esc")
 	if err != nil {
 		return err
 	}
@@ -1559,4 +1562,54 @@ func (h *httpMultiRequest) Execute(filePath string) error {
 	}
 
 	return expectResultsCount(results, 1)
+}
+
+type httpRawPathSingleSlash struct{}
+
+func (h *httpRawPathSingleSlash) Execute(filepath string) error {
+	expectedPath := "/index.php"
+	results, err := testutils.RunNucleiBinaryAndGetCombinedOutput(debug, []string{"-t", filepath, "-u", "scanme.sh/index.php", "-debug-req"})
+	if err != nil {
+		return err
+	}
+
+	var actual string
+	for _, v := range strings.Split(results, "\n") {
+		if strings.Contains(v, "GET") {
+			parts := strings.Fields(v)
+			if len(parts) == 3 {
+				actual = parts[1]
+			}
+		}
+	}
+
+	if actual != expectedPath {
+		return fmt.Errorf("expected: %v\n\nactual: %v", expectedPath, actual)
+	}
+	return nil
+}
+
+type httpRawUnsafePathSingleSlash struct{}
+
+func (h *httpRawUnsafePathSingleSlash) Execute(filepath string) error {
+	expectedPath := "/index.php"
+	results, err := testutils.RunNucleiBinaryAndGetCombinedOutput(debug, []string{"-t", filepath, "-u", "scanme.sh/index.php", "-debug-req"})
+	if err != nil {
+		return err
+	}
+
+	var actual string
+	for _, v := range strings.Split(results, "\n") {
+		if strings.Contains(v, "GET") {
+			parts := strings.Fields(v)
+			if len(parts) == 3 {
+				actual = parts[1]
+			}
+		}
+	}
+
+	if actual != expectedPath {
+		return fmt.Errorf("expected: %v\n\nactual: %v", expectedPath, actual)
+	}
+	return nil
 }

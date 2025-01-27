@@ -83,6 +83,9 @@ func (q *Header) Delete(key string) error {
 func (q *Header) Rebuild() (*retryablehttp.Request, error) {
 	cloned := q.req.Clone(context.Background())
 	q.value.parsed.Iterate(func(key string, value any) bool {
+		if strings.TrimSpace(key) == "" {
+			return true
+		}
 		if strings.EqualFold(key, "Host") {
 			return true
 		}
@@ -100,6 +103,14 @@ func (q *Header) Rebuild() (*retryablehttp.Request, error) {
 		return true
 	})
 	return cloned, nil
+}
+
+// Clones current state of this component
+func (q *Header) Clone() Component {
+	return &Header{
+		value: q.value.Clone(),
+		req:   q.req.Clone(context.Background()),
+	}
 }
 
 // A list of headers that are essential to the request and

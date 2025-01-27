@@ -4,6 +4,7 @@ import (
 	"github.com/pkg/errors"
 
 	"github.com/projectdiscovery/gologger"
+	"github.com/projectdiscovery/nuclei/v3/pkg/keys"
 	"github.com/projectdiscovery/nuclei/v3/pkg/model"
 	"github.com/projectdiscovery/nuclei/v3/pkg/protocols"
 	"github.com/projectdiscovery/nuclei/v3/pkg/utils/stats"
@@ -86,6 +87,10 @@ func parseWorkflowTemplate(workflow *workflows.WorkflowTemplate, preprocessor Pr
 			stats.Increment(SkippedUnsignedStats)
 			continue
 		}
+		if template.UsesRequestSignature() && !template.Verified {
+			stats.Increment(SkippedRequestSignatureStats)
+			continue
+		}
 
 		if len(template.RequestsCode) > 0 {
 			if !options.Options.EnableCodeTemplates {
@@ -96,6 +101,17 @@ func parseWorkflowTemplate(workflow *workflows.WorkflowTemplate, preprocessor Pr
 				gologger.Warning().Msgf("skipping unverified code template from workflow: %v\n", path)
 				continue
 			}
+		}
+
+		// increment signed/unsigned counters
+		if template.Verified {
+			if template.TemplateVerifier == "" {
+				SignatureStats[keys.PDVerifier].Add(1)
+			} else {
+				SignatureStats[template.TemplateVerifier].Add(1)
+			}
+		} else {
+			SignatureStats[Unsigned].Add(1)
 		}
 		workflowTemplates = append(workflowTemplates, template)
 	}

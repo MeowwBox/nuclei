@@ -1,6 +1,9 @@
 package dataformat
 
-import mapsutil "github.com/projectdiscovery/utils/maps"
+import (
+	mapsutil "github.com/projectdiscovery/utils/maps"
+	"golang.org/x/exp/maps"
+)
 
 // KV is a key-value struct
 // that is implemented or used by fuzzing package
@@ -10,8 +13,20 @@ import mapsutil "github.com/projectdiscovery/utils/maps"
 // if it's not important/significant (ex: json,xml) we use map
 // this also allows us to iteratively implement ordered map
 type KV struct {
-	Map        map[string]interface{}
+	Map        mapsutil.Map[string, any]
 	OrderedMap *mapsutil.OrderedMap[string, any]
+}
+
+// Clones the current state of the KV struct
+func (kv *KV) Clone() KV {
+	newKV := KV{}
+	if kv.OrderedMap == nil {
+		newKV.Map = maps.Clone(kv.Map)
+		return newKV
+	}
+	clonedOrderedMap := kv.OrderedMap.Clone()
+	newKV.OrderedMap = &clonedOrderedMap
+	return newKV
 }
 
 // IsNIL returns true if the KV struct is nil

@@ -61,6 +61,7 @@ func (q *Query) Iterate(callback func(key string, value interface{}) error) (err
 // SetValue sets a value in the component
 // for a key
 func (q *Query) SetValue(key string, value string) error {
+	// Is this safe?
 	if !q.value.SetParsedValue(key, value) {
 		return ErrSetValue
 	}
@@ -91,4 +92,12 @@ func (q *Query) Rebuild() (*retryablehttp.Request, error) {
 	cloned.Params.Decode(encoded)
 	cloned.Update()
 	return cloned, nil
+}
+
+// Clones current state to a new component
+func (q *Query) Clone() Component {
+	return &Query{
+		value: q.value.Clone(),
+		req:   q.req.Clone(context.Background()),
+	}
 }

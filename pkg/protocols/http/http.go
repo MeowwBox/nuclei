@@ -3,12 +3,18 @@ package http
 import (
 	"bytes"
 	"fmt"
+	"math"
 	"strings"
+	"time"
 
+	"github.com/invopop/jsonschema"
 	json "github.com/json-iterator/go"
 	"github.com/pkg/errors"
 
+	_ "github.com/projectdiscovery/nuclei/v3/pkg/fuzz/analyzers/time"
+
 	"github.com/projectdiscovery/nuclei/v3/pkg/fuzz"
+	"github.com/projectdiscovery/nuclei/v3/pkg/fuzz/analyzers"
 	"github.com/projectdiscovery/nuclei/v3/pkg/operators"
 	"github.com/projectdiscovery/nuclei/v3/pkg/operators/matchers"
 	"github.com/projectdiscovery/nuclei/v3/pkg/protocols"
@@ -17,6 +23,7 @@ import (
 	"github.com/projectdiscovery/nuclei/v3/pkg/protocols/common/protocolstate"
 	"github.com/projectdiscovery/nuclei/v3/pkg/protocols/http/httpclientpool"
 	httputil "github.com/projectdiscovery/nuclei/v3/pkg/protocols/utils/http"
+	"github.com/projectdiscovery/nuclei/v3/pkg/utils/stats"
 	"github.com/projectdiscovery/rawhttp"
 	"github.com/projectdiscovery/retryablehttp-go"
 	fileutil "github.com/projectdiscovery/utils/file"
@@ -124,6 +131,9 @@ type Request struct {
 
 	// Fuzzing describes schema to fuzz http requests
 	Fuzzing []*fuzz.Rule `yaml:"fuzzing,omitempty" json:"fuzzing,omitempty" jsonschema:"title=fuzzin rules for http fuzzing,description=Fuzzing describes rule schema to fuzz http requests"`
+	// description: |
+	//   Analyzer is an analyzer to use for matching the response.
+	Analyzer *analyzers.AnalyzerTemplate `yaml:"analyzer,omitempty" json:"analyzer,omitempty" jsonschema:"title=analyzer for http request,description=Analyzer for HTTP Request"`
 
 	CompiledOperators *operators.Operators `yaml:"-" json:"-"`
 
@@ -144,6 +154,10 @@ type Request struct {
 	// values:
 	//   - "AWS"
 	Signature SignatureTypeHolder `yaml:"signature,omitempty" json:"signature,omitempty" jsonschema:"title=signature is the http request signature method,description=Signature is the HTTP Request signature Method,enum=AWS"`
+
+	// description: |
+	//   SkipSecretFile skips the authentication or authorization configured in the secret file.
+	SkipSecretFile bool `yaml:"skip-secret-file,omitempty" json:"skip-secret-file,omitempty" jsonschema:"title=bypass secret file,description=Skips the authentication or authorization configured in the secret file"`
 
 	// description: |
 	//   CookieReuse is an optional setting that enables cookie reuse for
@@ -211,13 +225,38 @@ type Request struct {
 	//  DisablePathAutomerge disables merging target url path with raw request path
 	DisablePathAutomerge bool `yaml:"disable-path-automerge,omitempty" json:"disable-path-automerge,omitempty" jsonschema:"title=disable auto merging of path,description=Disable merging target url path with raw request path"`
 	// description: |
-	//   Filter is matcher-like field to check if fuzzing should be performed on this request or not
-	FuzzingFilter []*matchers.Matcher `yaml:"filters,omitempty" json:"filter,omitempty" jsonschema:"title=filter for fuzzing,description=Filter is matcher-like field to check if fuzzing should be performed on this request or not"`
+	//   Fuzz PreCondition is matcher-like field to check if fuzzing should be performed on this request or not
+	FuzzPreCondition []*matchers.Matcher `yaml:"pre-condition,omitempty" json:"pre-condition,omitempty" jsonschema:"title=pre-condition for fuzzing/dast,description=PreCondition is matcher-like field to check if fuzzing should be performed on this request or not"`
 	// description: |
-	//   Filter condition is the condition to apply on the filter (AND/OR). Default is OR
-	FuzzingFilterCondition string `yaml:"filters-condition,omitempty" json:"filter-condition,omitempty" jsonschema:"title=condition between the filters,description=Conditions between the filters,enum=and,enum=or"`
-	// cached variables that may be used along with request.
-	fuzzingFilterCondition matchers.ConditionType `yaml:"-" json:"-"`
+	//  FuzzPreConditionOperator is the operator between multiple PreConditions for fuzzing Default is OR
+	FuzzPreConditionOperator string                 `yaml:"pre-condition-operator,omitempty" json:"pre-condition-operator,omitempty" jsonschema:"title=condition between the filters,description=Operator to use between multiple per-conditions,enum=and,enum=or"`
+	fuzzPreConditionOperator matchers.ConditionType `yaml:"-" json:"-"`
+	// description: |
+	//   GlobalMatchers marks matchers as static and applies globally to all result events from other templates
+	GlobalMatchers bool `yaml:"global-matchers,omitempty" json:"global-matchers,omitempty" jsonschema:"title=global matchers,description=marks matchers as static and applies globally to all result events from other templates"`
+}
+
+func (e Request) JSONSchemaExtend(schema *jsonschema.Schema) {
+	headersSchema, ok := schema.Properties.Get("headers")
+	if !ok {
+		return
+	}
+	headersSchema.PatternProperties = map[string]*jsonschema.Schema{
+		".*": {
+			OneOf: []*jsonschema.Schema{
+				{
+					Type: "string",
+				},
+				{
+					Type: "integer",
+				},
+				{
+					Type: "boolean",
+				},
+			},
+		},
+	}
+	headersSchema.Ref = ""
 }
 
 // Options returns executer options for http request
@@ -272,6 +311,21 @@ func (request *Request) Compile(options *protocols.ExecutorOptions) error {
 		},
 		RedirectFlow: httpclientpool.DontFollowRedirect,
 	}
+	var customTimeout int
+	if request.Analyzer != nil && request.Analyzer.Name == "time_delay" {
+		var timeoutVal int
+		if timeout, ok := request.Analyzer.Parameters["sleep_duration"]; ok {
+			timeoutVal, _ = timeout.(int)
+		} else {
+			timeoutVal = 5
+		}
+
+		// Add 3x buffer to the timeout
+		customTimeout = int(math.Ceil(float64(timeoutVal) * 3))
+	}
+	if customTimeout > 0 {
+		connectionConfiguration.Connection.CustomMaxTimeout = time.Duration(customTimeout) * time.Second
+	}
 
 	if request.Redirects || options.Options.FollowRedirects {
 		connectionConfiguration.RedirectFlow = httpclientpool.FollowAllRedirect
@@ -312,7 +366,7 @@ func (request *Request) Compile(options *protocols.ExecutorOptions) error {
 				request.Raw[i] = strings.ReplaceAll(raw, "\n", "\r\n")
 			}
 		}
-		request.rawhttpClient = httpclientpool.GetRawHTTP(options.Options)
+		request.rawhttpClient = httpclientpool.GetRawHTTP(options)
 	}
 	if len(request.Matchers) > 0 || len(request.Extractors) > 0 {
 		compiled := &request.Operators
@@ -326,15 +380,21 @@ func (request *Request) Compile(options *protocols.ExecutorOptions) error {
 
 	// === fuzzing filters ===== //
 
-	if request.FuzzingFilterCondition != "" {
-		request.fuzzingFilterCondition = matchers.ConditionTypes[request.FuzzingFilterCondition]
+	if request.FuzzPreConditionOperator != "" {
+		request.fuzzPreConditionOperator = matchers.ConditionTypes[request.FuzzPreConditionOperator]
 	} else {
-		request.fuzzingFilterCondition = matchers.ORCondition
+		request.fuzzPreConditionOperator = matchers.ORCondition
 	}
 
-	for _, filter := range request.FuzzingFilter {
+	for _, filter := range request.FuzzPreCondition {
 		if err := filter.CompileMatchers(); err != nil {
 			return errors.Wrap(err, "could not compile matcher")
+		}
+	}
+
+	if request.Analyzer != nil {
+		if analyzer := analyzers.GetAnalyzer(request.Analyzer.Name); analyzer == nil {
+			return errors.Errorf("analyzer %s not found", request.Analyzer.Name)
 		}
 	}
 
@@ -412,12 +472,34 @@ func (request *Request) Compile(options *protocols.ExecutorOptions) error {
 		}
 	}
 	if len(request.Payloads) > 0 {
-		// specifically for http requests high concurrency and and threads will lead to memory exausthion, hence reduce the maximum parallelism
-		if protocolstate.IsLowOnMemory() {
-			request.Threads = protocolstate.GuardThreadsOrDefault(request.Threads)
+		// Due to a known issue (https://github.com/projectdiscovery/nuclei/issues/5015),
+		// dynamic extractors cannot be used with payloads. To address this,
+		// execution is handled by the standard engine without concurrency,
+		// achieved by setting the thread count to 0.
+
+		// this limitation will be removed once we have a better way to handle dynamic extractors with payloads
+		hasMultipleRequests := false
+		if len(request.Raw)+len(request.Path) > 1 {
+			hasMultipleRequests = true
 		}
-		// if we have payloads, adjust threads if none specified
-		request.Threads = options.GetThreadsForNPayloadRequests(request.Requests(), request.Threads)
+		// look for dynamic extractor ( internal: true with named extractor)
+		hasNamedInternalExtractor := false
+		for _, extractor := range request.Extractors {
+			if extractor.Internal && extractor.Name != "" {
+				hasNamedInternalExtractor = true
+				break
+			}
+		}
+		if hasNamedInternalExtractor && hasMultipleRequests {
+			stats.Increment(SetThreadToCountZero)
+			request.Threads = 0
+		} else {
+			// specifically for http requests high concurrency and and threads will lead to memory exausthion, hence reduce the maximum parallelism
+			if protocolstate.IsLowOnMemory() {
+				request.Threads = protocolstate.GuardThreadsOrDefault(request.Threads)
+			}
+			request.Threads = options.GetThreadsForNPayloadRequests(request.Requests(), request.Threads)
+		}
 	}
 
 	return nil
@@ -443,4 +525,12 @@ func (request *Request) Requests() int {
 		return requests
 	}
 	return len(request.Path)
+}
+
+const (
+	SetThreadToCountZero = "set-thread-count-to-zero"
+)
+
+func init() {
+	stats.NewEntry(SetThreadToCountZero, "Setting thread count to 0 for %d templates, dynamic extractors are not supported with payloads yet")
 }

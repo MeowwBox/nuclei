@@ -2,6 +2,7 @@ package compiler
 
 import (
 	"bytes"
+	"context"
 	"encoding/json"
 	"fmt"
 	"reflect"
@@ -10,6 +11,7 @@ import (
 	"github.com/dop251/goja"
 	"github.com/dop251/goja_nodejs/console"
 	"github.com/dop251/goja_nodejs/require"
+	"github.com/kitabisa/go-ci"
 	"github.com/projectdiscovery/gologger"
 	_ "github.com/projectdiscovery/nuclei/v3/pkg/js/generated/go/libbytes"
 	_ "github.com/projectdiscovery/nuclei/v3/pkg/js/generated/go/libfs"
@@ -36,7 +38,7 @@ import (
 	"github.com/projectdiscovery/nuclei/v3/pkg/js/libs/goconsole"
 	"github.com/projectdiscovery/nuclei/v3/pkg/protocols/common/protocolstate"
 	stringsutil "github.com/projectdiscovery/utils/strings"
-	"github.com/remeh/sizedwaitgroup"
+	syncutil "github.com/projectdiscovery/utils/sync"
 )
 
 const (
@@ -51,10 +53,18 @@ var (
 		// autoregister console node module with default printer it uses gologger backend
 		require.RegisterNativeModule(console.ModuleName, console.RequireWithPrinter(goconsole.NewGoConsolePrinter()))
 	})
-	pooljsc    sizedwaitgroup.SizedWaitGroup
+	pooljsc    *syncutil.AdaptiveWaitGroup
 	lazySgInit = sync.OnceFunc(func() {
-		pooljsc = sizedwaitgroup.New(PoolingJsVmConcurrency)
+		pooljsc, _ = syncutil.New(syncutil.WithSize(PoolingJsVmConcurrency))
 	})
+	sgResizeCheck = func(ctx context.Context) {
+		// resize check point
+		if pooljsc.Size != PoolingJsVmConcurrency {
+			if err := pooljsc.Resize(ctx, PoolingJsVmConcurrency); err != nil {
+				gologger.Warning().Msgf("Could not resize workpool: %s\n", err)
+			}
+		}
+	}
 )
 
 var gojapool = &sync.Pool{
@@ -75,11 +85,18 @@ func executeWithRuntime(runtime *goja.Runtime, p *goja.Program, args *ExecuteArg
 			opts.Cleanup(runtime)
 		}
 	}()
+
+	// TODO(dwisiswant0): remove this once we get the RCA.
 	defer func() {
+		if ci.IsCI() {
+			return
+		}
+
 		if r := recover(); r != nil {
 			err = fmt.Errorf("panic: %s", r)
 		}
 	}()
+
 	// set template ctx
 	_ = runtime.Set("template", args.TemplateCtx)
 	// set args
@@ -116,6 +133,8 @@ func executeWithPoolingProgram(p *goja.Program, args *ExecuteArgs, opts *Execute
 	// its unknown (most likely cannot be done) to limit max js runtimes at a moment without making it static
 	// unlike sync.Pool which reacts to GC and its purposes is to reuse objects rather than creating new ones
 	lazySgInit()
+	sgResizeCheck(opts.Context)
+
 	pooljsc.Add()
 	defer pooljsc.Done()
 	runtime := gojapool.Get().(*goja.Runtime)
@@ -230,5 +249,5 @@ func stringify(gojaValue goja.Value, runtime *goja.Runtime) string {
 		}
 	}
 	// for everything else stringify
-	return fmt.Sprintf("%v", value)
+	return fmt.Sprintf("%+v", value)
 }

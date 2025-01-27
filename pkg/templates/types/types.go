@@ -69,6 +69,18 @@ func GetSupportedProtocolTypes() ProtocolTypes {
 	return result
 }
 
+// SupportedProtocolsStrings returns a slice of strings of supported protocols
+func SupportedProtocolsStrings() []string {
+	var result []string
+	for _, protocol := range GetSupportedProtocolTypes() {
+		if protocol.String() == "" {
+			continue
+		}
+		result = append(result, protocol.String())
+	}
+	return result
+}
+
 func toProtocolType(valueToMap string) (ProtocolType, error) {
 	normalizedValue := normalizeValue(valueToMap)
 	for key, currentValue := range protocolMappings {
@@ -92,7 +104,7 @@ type TypeHolder struct {
 	ProtocolType ProtocolType `mapping:"true"`
 }
 
-func (holder TypeHolder) JSONSchemaType() *jsonschema.Schema {
+func (holder TypeHolder) JSONSchema() *jsonschema.Schema {
 	gotType := &jsonschema.Schema{
 		Type:        "string",
 		Title:       "type of the protocol",

@@ -159,8 +159,6 @@ export interface SMBCapabilities {
  */
 export interface SMBLog {
     
-    NativeOs?: string,
-    
     NTLM?: string,
     
     GroupName?: string,
@@ -169,13 +167,15 @@ export interface SMBLog {
     
     SupportV1?: boolean,
     
+    NativeOs?: string,
+    
+    Version?: SMBVersions,
+    
     Capabilities?: SMBCapabilities,
     
     NegotiationLog?: NegotiationLog,
     
     SessionSetupLog?: SessionSetupLog,
-    
-    Version?: SMBVersions,
 }
 
 
@@ -201,10 +201,6 @@ export interface SMBVersions {
  */
 export interface ServiceSMB {
     
-    SigningEnabled?: boolean,
-    
-    SigningRequired?: boolean,
-    
     OSVersion?: string,
     
     NetBIOSComputerName?: string,
@@ -216,6 +212,10 @@ export interface ServiceSMB {
     DNSDomainName?: string,
     
     ForestName?: string,
+    
+    SigningEnabled?: boolean,
+    
+    SigningRequired?: boolean,
 }
 
 

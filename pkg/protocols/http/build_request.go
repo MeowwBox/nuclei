@@ -14,6 +14,7 @@ import (
 
 	"github.com/projectdiscovery/gologger"
 	"github.com/projectdiscovery/nuclei/v3/pkg/authprovider"
+	"github.com/projectdiscovery/nuclei/v3/pkg/fuzz"
 	"github.com/projectdiscovery/nuclei/v3/pkg/protocols/common/contextargs"
 	"github.com/projectdiscovery/nuclei/v3/pkg/protocols/common/expressions"
 	"github.com/projectdiscovery/nuclei/v3/pkg/protocols/common/generators"
@@ -32,6 +33,10 @@ import (
 	urlutil "github.com/projectdiscovery/utils/url"
 )
 
+const (
+	ReqURLPatternKey = "req_url_pattern"
+)
+
 // ErrEvalExpression
 var (
 	ErrEvalExpression = errorutil.NewWithTag("expr", "could not evaluate helper expressions")
@@ -48,6 +53,38 @@ type generatedRequest struct {
 	dynamicValues        map[string]interface{}
 	interactshURLs       []string
 	customCancelFunction context.CancelFunc
+	// requestURLPattern tracks unmodified request url pattern without values ( it is used for constant vuln_hash)
+	// ex: {{BaseURL}}/api/exp?param={{randstr}}
+	requestURLPattern string
+
+	fuzzGeneratedRequest fuzz.GeneratedRequest
+}
+
+// setReqURLPattern sets the url request pattern for the generated request
+func (gr *generatedRequest) setReqURLPattern(reqURLPattern string) {
+	data := strings.Split(reqURLPattern, "\n")
+	if len(data) > 1 {
+		reqURLPattern = strings.TrimSpace(data[0])
+		// this is raw request (if it has 3 parts after strings.Fields then its valid only use 2nd part)
+		parts := strings.Fields(reqURLPattern)
+		if len(parts) >= 3 {
+			// remove first and last and use all in between
+			parts = parts[1 : len(parts)-1]
+			reqURLPattern = strings.Join(parts, " ")
+		}
+	} else {
+		reqURLPattern = strings.TrimSpace(reqURLPattern)
+	}
+
+	// now urlRequestPattern is generated replace preprocessor values with actual placeholders
+	// that were used (these are called generated 'constants' and contains {{}} in var name)
+	for k, v := range gr.original.options.Constants {
+		if strings.HasPrefix(k, "{{") && strings.HasSuffix(k, "}}") {
+			// this takes care of all preprocessors ( currently we have randstr and its variations)
+			reqURLPattern = strings.ReplaceAll(reqURLPattern, fmt.Sprint(v), k)
+		}
+	}
+	gr.requestURLPattern = reqURLPattern
 }
 
 // ApplyAuth applies the auth provider to the generated request
@@ -56,9 +93,9 @@ func (g *generatedRequest) ApplyAuth(provider authprovider.AuthProvider) {
 		return
 	}
 	if g.request != nil {
-		auth := provider.LookupURLX(g.request.URL)
-		if auth != nil {
-			auth.ApplyOnRR(g.request)
+		authStrategies := provider.LookupURLX(g.request.URL)
+		for _, strategy := range authStrategies {
+			strategy.ApplyOnRR(g.request)
 		}
 	}
 	if g.rawRequest != nil {
@@ -67,11 +104,11 @@ func (g *generatedRequest) ApplyAuth(provider authprovider.AuthProvider) {
 			gologger.Warning().Msgf("[authprovider] Could not parse URL %s: %s\n", g.rawRequest.FullURL, err)
 			return
 		}
-		auth := provider.LookupURLX(parsed)
-		if auth != nil {
-			// here we need to apply it custom because we don't have a standard/official
-			// rawhttp request format ( which we probably should have )
-			g.rawRequest.ApplyAuthStrategy(auth)
+		authStrategies := provider.LookupURLX(parsed)
+		// here we need to apply it custom because we don't have a standard/official
+		// rawhttp request format ( which we probably should have )
+		for _, strategy := range authStrategies {
+			g.rawRequest.ApplyAuthStrategy(strategy)
 		}
 	}
 }
@@ -96,7 +133,13 @@ func (r *requestGenerator) Total() int {
 
 // Make creates a http request for the provided input.
 // It returns ErrNoMoreRequests as error when all the requests have been exhausted.
-func (r *requestGenerator) Make(ctx context.Context, input *contextargs.Context, reqData string, payloads, dynamicValues map[string]interface{}) (*generatedRequest, error) {
+func (r *requestGenerator) Make(ctx context.Context, input *contextargs.Context, reqData string, payloads, dynamicValues map[string]interface{}) (gr *generatedRequest, err error) {
+	origReqData := reqData
+	defer func() {
+		if gr != nil {
+			gr.setReqURLPattern(origReqData)
+		}
+	}()
 	// value of `reqData` depends on the type of request specified in template
 	// 1. If request is raw request =  reqData contains raw request (i.e http request dump)
 	// 2. If request is Normal ( simply put not a raw request) (Ex: with placeholders `path`) = reqData contains relative path
@@ -107,9 +150,7 @@ func (r *requestGenerator) Make(ctx context.Context, input *contextargs.Context,
 		// skip creating template context if not available
 		dynamicValues = generators.MergeMaps(dynamicValues, r.request.options.GetTemplateCtx(input.MetaInput).GetAll())
 	}
-	if r.request.SelfContained {
-		return r.makeSelfContainedRequest(ctx, reqData, payloads, dynamicValues)
-	}
+
 	isRawRequest := len(r.request.Raw) > 0
 	// replace interactsh variables with actual interactsh urls
 	if r.options.Interactsh != nil {
@@ -121,6 +162,10 @@ func (r *requestGenerator) Make(ctx context.Context, input *contextargs.Context,
 		for payloadName, payloadValue := range payloads {
 			payloads[payloadName] = types.ToStringNSlice(payloadValue)
 		}
+	}
+
+	if r.request.SelfContained {
+		return r.makeSelfContainedRequest(ctx, reqData, payloads, dynamicValues)
 	}
 
 	// Parse target url
@@ -164,7 +209,7 @@ func (r *requestGenerator) Make(ctx context.Context, input *contextargs.Context,
 	finalVars := generators.MergeMaps(allVars, payloads)
 
 	if vardump.EnableVarDump {
-		gologger.Debug().Msgf("HTTP Protocol request variables: \n%s\n", vardump.DumpVariables(finalVars))
+		gologger.Debug().Msgf("HTTP Protocol request variables: %s\n", vardump.DumpVariables(finalVars))
 	}
 
 	// Note: If possible any changes to current logic (i.e evaluate -> then parse URL)
@@ -237,7 +282,7 @@ func (r *requestGenerator) makeSelfContainedRequest(ctx context.Context, data st
 			return nil, fmt.Errorf("malformed request supplied")
 		}
 
-		if err := expressions.ContainsUnresolvedVariables(parts[1]); err != nil {
+		if err := expressions.ContainsUnresolvedVariables(parts[1]); err != nil && !r.request.SkipVariablesCheck {
 			return nil, ErrUnresolvedVars.Msgf(parts[1])
 		}
 
@@ -256,7 +301,7 @@ func (r *requestGenerator) makeSelfContainedRequest(ctx context.Context, data st
 		}
 		return r.generateRawRequest(ctx, data, parsed, values, payloads)
 	}
-	if err := expressions.ContainsUnresolvedVariables(data); err != nil {
+	if err := expressions.ContainsUnresolvedVariables(data); err != nil && !r.request.SkipVariablesCheck {
 		// early exit: if there are any unresolved variables in `path` after evaluation
 		// then return early since this will definitely fail
 		return nil, ErrUnresolvedVars.Msgf(data)

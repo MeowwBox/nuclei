@@ -37,6 +37,8 @@ const (
 	TLSA
 	// name:ANY
 	ANY
+	// name:SRV
+	SRV
 	limit
 )
 
@@ -54,6 +56,7 @@ var DNSRequestTypeMapping = map[DNSRequestType]string{
 	CAA:   "CAA",
 	TLSA:  "TLSA",
 	ANY:   "ANY",
+	SRV:   "SRV",
 }
 
 // GetSupportedDNSRequestTypes returns list of supported types
@@ -92,7 +95,7 @@ func (holder DNSRequestTypeHolder) String() string {
 	return holder.DNSRequestType.String()
 }
 
-func (holder DNSRequestTypeHolder) JSONSchemaType() *jsonschema.Schema {
+func (holder DNSRequestTypeHolder) JSONSchema() *jsonschema.Schema {
 	gotType := &jsonschema.Schema{
 		Type:        "string",
 		Title:       "type of DNS request to make",

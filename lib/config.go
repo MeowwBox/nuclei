@@ -2,6 +2,7 @@ package nuclei
 
 import (
 	"context"
+	"errors"
 	"time"
 
 	"github.com/projectdiscovery/goflags"
@@ -9,6 +10,7 @@ import (
 	"github.com/projectdiscovery/ratelimit"
 
 	"github.com/projectdiscovery/nuclei/v3/pkg/authprovider"
+	"github.com/projectdiscovery/nuclei/v3/pkg/catalog"
 	"github.com/projectdiscovery/nuclei/v3/pkg/model/types/severity"
 	"github.com/projectdiscovery/nuclei/v3/pkg/output"
 	"github.com/projectdiscovery/nuclei/v3/pkg/progress"
@@ -115,25 +117,69 @@ type Concurrency struct {
 	HeadlessTemplateConcurrency   int // number of templates to run concurrently for headless templates (per host in host-spray mode)
 	JavascriptTemplateConcurrency int // number of templates to run concurrently for javascript templates (per host in host-spray mode)
 	TemplatePayloadConcurrency    int // max concurrent payloads to run for a template (a good default is 25)
+	ProbeConcurrency              int // max concurrent http probes to run (a good default is 50)
 }
 
 // WithConcurrency sets concurrency options
 func WithConcurrency(opts Concurrency) NucleiSDKOptions {
 	return func(e *NucleiEngine) error {
+		// minimum required is 1
+		if opts.TemplateConcurrency <= 0 {
+			return errors.New("template threads must be at least 1")
+		}
+		if opts.HostConcurrency <= 0 {
+			return errors.New("host concurrency must be at least 1")
+		}
+		if opts.HeadlessHostConcurrency <= 0 {
+			return errors.New("headless host concurrency must be at least 1")
+		}
+		if opts.HeadlessTemplateConcurrency <= 0 {
+			return errors.New("headless template threads must be at least 1")
+		}
+		if opts.JavascriptTemplateConcurrency <= 0 {
+			return errors.New("js must be at least 1")
+		}
+		if opts.TemplatePayloadConcurrency <= 0 {
+			return errors.New("payload concurrency must be at least 1")
+		}
+		if opts.ProbeConcurrency <= 0 {
+			return errors.New("probe concurrency must be at least 1")
+		}
 		e.opts.TemplateThreads = opts.TemplateConcurrency
 		e.opts.BulkSize = opts.HostConcurrency
 		e.opts.HeadlessBulkSize = opts.HeadlessHostConcurrency
 		e.opts.HeadlessTemplateThreads = opts.HeadlessTemplateConcurrency
 		e.opts.JsConcurrency = opts.JavascriptTemplateConcurrency
 		e.opts.PayloadConcurrency = opts.TemplatePayloadConcurrency
+		e.opts.ProbeConcurrency = opts.ProbeConcurrency
+		return nil
+	}
+}
+
+// WithResponseReadSize sets the maximum size of response to read in bytes.
+// A value of 0 means no limit. Recommended values: 1MB (1048576) to 10MB (10485760).
+func WithResponseReadSize(responseReadSize int) NucleiSDKOptions {
+	return func(e *NucleiEngine) error {
+		if responseReadSize < 0 {
+			return errors.New("response read size must be non-negative")
+		}
+		e.opts.ResponseReadSize = responseReadSize
 		return nil
 	}
 }
 
 // WithGlobalRateLimit sets global rate (i.e all hosts combined) limit options
+// Deprecated: will be removed in favour of WithGlobalRateLimitCtx in next release
 func WithGlobalRateLimit(maxTokens int, duration time.Duration) NucleiSDKOptions {
+	return WithGlobalRateLimitCtx(context.Background(), maxTokens, duration)
+}
+
+// WithGlobalRateLimitCtx allows setting a global rate limit for the entire engine
+func WithGlobalRateLimitCtx(ctx context.Context, maxTokens int, duration time.Duration) NucleiSDKOptions {
 	return func(e *NucleiEngine) error {
-		e.rateLimiter = ratelimit.New(context.Background(), uint(maxTokens), duration)
+		e.opts.RateLimit = maxTokens
+		e.opts.RateLimitDuration = duration
+		e.rateLimiter = ratelimit.New(ctx, uint(e.opts.RateLimit), e.opts.RateLimitDuration)
 		return nil
 	}
 }
@@ -245,10 +291,23 @@ func WithNetworkConfig(opts NetworkConfig) NucleiSDKOptions {
 		if e.mode == threadSafe {
 			return ErrOptionsNotSupported.Msgf("WithNetworkConfig")
 		}
+		e.opts.NoHostErrors = opts.DisableMaxHostErr
+		e.opts.MaxHostError = opts.MaxHostError
+		if e.opts.ShouldUseHostError() {
+			maxHostError := opts.MaxHostError
+			if e.opts.TemplateThreads > maxHostError {
+				gologger.Print().Msgf("[%v] The concurrency value is higher than max-host-error", e.executerOpts.Colorizer.BrightYellow("WRN"))
+				gologger.Info().Msgf("Adjusting max-host-error to the concurrency value: %d", e.opts.TemplateThreads)
+				maxHostError = e.opts.TemplateThreads
+				e.opts.MaxHostError = maxHostError
+			}
+			cache := hosterrorscache.New(maxHostError, hosterrorscache.DefaultMaxHostsCount, e.opts.TrackError)
+			cache.SetVerbose(e.opts.Verbose)
+			e.hostErrCache = cache
+		}
 		e.opts.Timeout = opts.Timeout
 		e.opts.Retries = opts.Retries
 		e.opts.LeaveDefaultPorts = opts.LeaveDefaultPorts
-		e.hostErrCache = hosterrorscache.New(opts.MaxHostError, hosterrorscache.DefaultMaxHostsCount, opts.TrackError)
 		e.opts.Interface = opts.Interface
 		e.opts.SourceIP = opts.SourceIP
 		e.opts.SystemResolvers = opts.SystemResolvers
@@ -280,7 +339,7 @@ func WithScanStrategy(strategy string) NucleiSDKOptions {
 // OutputWriter
 type OutputWriter output.Writer
 
-// UseWriter allows setting custom output writer
+// UseOutputWriter allows setting custom output writer
 // by default a mock writer is used with user defined callback
 // if outputWriter is used callback will be ignored
 func UseOutputWriter(writer OutputWriter) NucleiSDKOptions {
@@ -339,6 +398,31 @@ func WithSandboxOptions(allowLocalFileAccess bool, restrictLocalNetworkAccess bo
 func EnableCodeTemplates() NucleiSDKOptions {
 	return func(e *NucleiEngine) error {
 		e.opts.EnableCodeTemplates = true
+		e.opts.EnableSelfContainedTemplates = true
+		return nil
+	}
+}
+
+// EnableSelfContainedTemplates allows loading/executing self-contained templates
+func EnableSelfContainedTemplates() NucleiSDKOptions {
+	return func(e *NucleiEngine) error {
+		e.opts.EnableSelfContainedTemplates = true
+		return nil
+	}
+}
+
+// EnableGlobalMatchersTemplates allows loading/executing global-matchers templates
+func EnableGlobalMatchersTemplates() NucleiSDKOptions {
+	return func(e *NucleiEngine) error {
+		e.opts.EnableGlobalMatchersTemplates = true
+		return nil
+	}
+}
+
+// EnableFileTemplates allows loading/executing file protocol templates
+func EnableFileTemplates() NucleiSDKOptions {
+	return func(e *NucleiEngine) error {
+		e.opts.EnableFileTemplates = true
 		return nil
 	}
 }
@@ -351,15 +435,35 @@ func WithHeaders(headers []string) NucleiSDKOptions {
 	}
 }
 
-// EnablePassiveMode allows enabling passive HTTP response processing mode
-func EnablePassiveMode() NucleiSDKOptions {
+// WithVars allows setting custom variables to use in templates/workflows context
+func WithVars(vars []string) NucleiSDKOptions {
+	// Create a goflags.RuntimeMap
+	runtimeVars := goflags.RuntimeMap{}
+	for _, v := range vars {
+		err := runtimeVars.Set(v)
+		if err != nil {
+			return func(e *NucleiEngine) error {
+				return err
+			}
+		}
+	}
+
 	return func(e *NucleiEngine) error {
-		e.opts.OfflineHTTP = true
+		e.opts.Vars = runtimeVars
 		return nil
 	}
 }
 
-// WithAuthOptions allows setting a custom authprovider implementation
+// EnablePassiveMode allows enabling passive HTTP response processing mode
+func EnablePassiveMode() NucleiSDKOptions {
+	return func(e *NucleiEngine) error {
+		e.opts.OfflineHTTP = true
+		e.opts.DisableHTTPProbe = true
+		return nil
+	}
+}
+
+// WithAuthProvider allows setting a custom authprovider implementation
 func WithAuthProvider(provider authprovider.AuthProvider) NucleiSDKOptions {
 	return func(e *NucleiEngine) error {
 		e.authprovider = provider
@@ -376,10 +480,34 @@ func LoadSecretsFromFile(files []string, prefetch bool) NucleiSDKOptions {
 	}
 }
 
-// EnableFuzzTemplates allows enabling template fuzzing
-func EnableFuzzTemplates() NucleiSDKOptions {
+// DASTMode only run DAST templates
+func DASTMode() NucleiSDKOptions {
 	return func(e *NucleiEngine) error {
-		e.opts.FuzzTemplates = true
+		e.opts.DAST = true
+		return nil
+	}
+}
+
+// SignedTemplatesOnly only run signed templates and disabled loading all unsigned templates
+func SignedTemplatesOnly() NucleiSDKOptions {
+	return func(e *NucleiEngine) error {
+		e.opts.DisableUnsignedTemplates = true
+		return nil
+	}
+}
+
+// WithCatalog uses a supplied catalog
+func WithCatalog(cat catalog.Catalog) NucleiSDKOptions {
+	return func(e *NucleiEngine) error {
+		e.catalog = cat
+		return nil
+	}
+}
+
+// DisableUpdateCheck disables nuclei update check
+func DisableUpdateCheck() NucleiSDKOptions {
+	return func(e *NucleiEngine) error {
+		DefaultConfig.DisableUpdateCheck()
 		return nil
 	}
 }

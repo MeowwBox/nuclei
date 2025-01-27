@@ -7,14 +7,15 @@ import (
 	"os"
 	"sort"
 	"strings"
+	"sync"
 
 	"github.com/logrusorgru/aurora"
 	"github.com/pkg/errors"
 	"github.com/projectdiscovery/gologger"
 	"github.com/projectdiscovery/nuclei/v3/pkg/catalog"
 	"github.com/projectdiscovery/nuclei/v3/pkg/catalog/config"
-	cfg "github.com/projectdiscovery/nuclei/v3/pkg/catalog/config"
 	"github.com/projectdiscovery/nuclei/v3/pkg/catalog/loader/filter"
+	"github.com/projectdiscovery/nuclei/v3/pkg/keys"
 	"github.com/projectdiscovery/nuclei/v3/pkg/model/types/severity"
 	"github.com/projectdiscovery/nuclei/v3/pkg/protocols"
 	"github.com/projectdiscovery/nuclei/v3/pkg/templates"
@@ -24,6 +25,7 @@ import (
 	"github.com/projectdiscovery/nuclei/v3/pkg/workflows"
 	"github.com/projectdiscovery/retryablehttp-go"
 	errorutil "github.com/projectdiscovery/utils/errors"
+	sliceutil "github.com/projectdiscovery/utils/slice"
 	stringsutil "github.com/projectdiscovery/utils/strings"
 	urlutil "github.com/projectdiscovery/utils/url"
 )
@@ -31,6 +33,7 @@ import (
 const (
 	httpPrefix  = "http://"
 	httpsPrefix = "https://"
+	AuthStoreId = "auth_store"
 )
 
 var (
@@ -39,6 +42,7 @@ var (
 
 // Config contains the configuration options for the loader
 type Config struct {
+	StoreId                  string // used to set store id (optional)
 	Templates                []string
 	TemplateURLs             []string
 	Workflows                []string
@@ -61,12 +65,11 @@ type Config struct {
 
 	Catalog         catalog.Catalog
 	ExecutorOptions protocols.ExecutorOptions
-
-	OnlyLoadHTTPFuzzing bool
 }
 
 // Store is a storage for loaded nuclei templates
 type Store struct {
+	id             string // id of the store (optional)
 	tagFilter      *templates.TagFilter
 	pathFilter     *filter.PathFilter
 	config         *Config
@@ -132,6 +135,7 @@ func New(cfg *Config) (*Store, error) {
 
 	// Create a tag filter based on provided configuration
 	store := &Store{
+		id:        cfg.StoreId,
 		config:    cfg,
 		tagFilter: tagFilter,
 		pathFilter: filter.NewPathFilter(&filter.PathFilterConfig{
@@ -230,6 +234,10 @@ func (store *Store) ReadTemplateFromURI(uri string, remote bool) ([]byte, error)
 	}
 }
 
+func (store *Store) ID() string {
+	return store.id
+}
+
 // Templates returns all the templates in the store
 func (store *Store) Templates() []*templates.Template {
 	return store.templates
@@ -256,6 +264,67 @@ var templateIDPathMap map[string]string
 
 func init() {
 	templateIDPathMap = make(map[string]string)
+}
+
+// LoadTemplatesOnlyMetadata loads only the metadata of the templates
+func (store *Store) LoadTemplatesOnlyMetadata() error {
+	templatePaths, errs := store.config.Catalog.GetTemplatesPath(store.finalTemplates)
+	store.logErroredTemplates(errs)
+
+	filteredTemplatePaths := store.pathFilter.Match(templatePaths)
+
+	validPaths := make(map[string]struct{})
+	for templatePath := range filteredTemplatePaths {
+		loaded, err := store.config.ExecutorOptions.Parser.LoadTemplate(templatePath, store.tagFilter, nil, store.config.Catalog)
+		if loaded || store.pathFilter.MatchIncluded(templatePath) {
+			validPaths[templatePath] = struct{}{}
+		}
+		if err != nil {
+			if strings.Contains(err.Error(), templates.ErrExcluded.Error()) {
+				stats.Increment(templates.TemplatesExcludedStats)
+				if config.DefaultConfig.LogAllEvents {
+					gologger.Print().Msgf("[%v] %v\n", aurora.Yellow("WRN").String(), err.Error())
+				}
+				continue
+			}
+			gologger.Warning().Msg(err.Error())
+		}
+	}
+	parserItem, ok := store.config.ExecutorOptions.Parser.(*templates.Parser)
+	if !ok {
+		return errors.New("invalid parser")
+	}
+	templatesCache := parserItem.Cache()
+
+	for templatePath := range validPaths {
+		template, _, _ := templatesCache.Has(templatePath)
+
+		if len(template.RequestsHeadless) > 0 && !store.config.ExecutorOptions.Options.Headless {
+			continue
+		}
+
+		if len(template.RequestsCode) > 0 && !store.config.ExecutorOptions.Options.EnableCodeTemplates {
+			continue
+		}
+
+		if template.IsFuzzing() && !store.config.ExecutorOptions.Options.DAST {
+			continue
+		}
+
+		if template.SelfContained && !store.config.ExecutorOptions.Options.EnableSelfContainedTemplates {
+			continue
+		}
+
+		if template.HasFileProtocol() && !store.config.ExecutorOptions.Options.EnableFileTemplates {
+			continue
+		}
+
+		if template != nil {
+			template.Path = templatePath
+			store.templates = append(store.templates, template)
+		}
+	}
+	return nil
 }
 
 // ValidateTemplates takes a list of templates and validates them
@@ -304,12 +373,29 @@ func (store *Store) areWorkflowOrTemplatesValid(filteredTemplatePaths map[string
 		if err != nil {
 			if isParsingError("Error occurred parsing template %s: %s\n", templatePath, err) {
 				areTemplatesValid = false
+				continue
 			}
+		} else if template == nil {
+			// NOTE(dwisiswant0): possibly global matchers template.
+			// This could definitely be handled better, for example by returning an
+			// `ErrGlobalMatchersTemplate` during `templates.Parse` and checking it
+			// with `errors.Is`.
+			//
+			// However, I’m not sure if every reference to it should be handled
+			// that way. Returning a `templates.Template` pointer would mean it’s
+			// an active template (sending requests), and adding a specific field
+			// like `isGlobalMatchers` in `templates.Template` (then checking it
+			// with a `*templates.Template.IsGlobalMatchersEnabled` method) would
+			// just introduce more unknown issues - like during template
+			// clustering, AFAIK.
+			continue
 		} else {
 			if existingTemplatePath, found := templateIDPathMap[template.ID]; !found {
 				templateIDPathMap[template.ID] = templatePath
 			} else {
-				areTemplatesValid = false
+				// TODO: until https://github.com/projectdiscovery/nuclei-templates/issues/11324 is deployed
+				// disable strict validation to allow GH actions to run
+				// areTemplatesValid = false
 				gologger.Warning().Msgf("Found duplicate template ID during validation '%s' => '%s': %s\n", templatePath, existingTemplatePath, template.ID)
 			}
 			if !isWorkflow && len(template.Workflows) > 0 {
@@ -388,72 +474,117 @@ func (store *Store) LoadTemplatesWithTags(templatesList, tags []string) []*templ
 	store.logErroredTemplates(errs)
 	templatePathMap := store.pathFilter.Match(includedTemplates)
 
-	loadedTemplates := make([]*templates.Template, 0, len(templatePathMap))
-	for templatePath := range templatePathMap {
-		loaded, err := store.config.ExecutorOptions.Parser.LoadTemplate(templatePath, store.tagFilter, tags, store.config.Catalog)
-		if loaded || store.pathFilter.MatchIncluded(templatePath) {
-			parsed, err := templates.Parse(templatePath, store.preprocessor, store.config.ExecutorOptions)
-			if err != nil {
-				// exclude templates not compatible with offline matching from total runtime warning stats
-				if !errors.Is(err, templates.ErrIncompatibleWithOfflineMatching) {
-					stats.Increment(templates.RuntimeWarningsStats)
-				}
-				gologger.Warning().Msgf("Could not parse template %s: %s\n", templatePath, err)
-			} else if parsed != nil {
-				if !parsed.Verified && store.config.ExecutorOptions.Options.DisableUnsignedTemplates {
-					// skip unverified templates when prompted to
-					stats.Increment(templates.SkippedUnsignedStats)
-					continue
-				}
-				if len(parsed.RequestsHeadless) > 0 && !store.config.ExecutorOptions.Options.Headless {
-					// donot include headless template in final list if headless flag is not set
-					stats.Increment(templates.HeadlessFlagWarningStats)
-					if config.DefaultConfig.LogAllEvents {
-						gologger.Print().Msgf("[%v] Headless flag is required for headless template '%s'.\n", aurora.Yellow("WRN").String(), templatePath)
-					}
-				} else if len(parsed.RequestsCode) > 0 && !store.config.ExecutorOptions.Options.EnableCodeTemplates {
-					// donot include 'Code' protocol custom template in final list if code flag is not set
-					stats.Increment(templates.CodeFlagWarningStats)
-					if config.DefaultConfig.LogAllEvents {
-						gologger.Print().Msgf("[%v] Code flag is required for code protocol template '%s'.\n", aurora.Yellow("WRN").String(), templatePath)
-					}
-				} else if len(parsed.RequestsCode) > 0 && !parsed.Verified && len(parsed.Workflows) == 0 {
-					// donot include unverified 'Code' protocol custom template in final list
-					stats.Increment(templates.UnsignedCodeWarning)
-					// these will be skipped so increment skip counter
-					stats.Increment(templates.SkippedUnsignedStats)
-					if config.DefaultConfig.LogAllEvents {
-						gologger.Print().Msgf("[%v] Tampered/Unsigned template at %v.\n", aurora.Yellow("WRN").String(), templatePath)
-					}
-				} else if parsed.IsFuzzing() && !store.config.ExecutorOptions.Options.FuzzTemplates {
-					stats.Increment(templates.FuzzFlagWarningStats)
-					if config.DefaultConfig.LogAllEvents {
-						gologger.Print().Msgf("[%v] Fuzz flag is required for fuzzing template '%s'.\n", aurora.Yellow("WRN").String(), templatePath)
-					}
-				} else if store.config.OnlyLoadHTTPFuzzing && !parsed.IsFuzzing() {
-					gologger.Warning().Msgf("Non-Fuzzing template '%s' can only be run on list input mode targets\n", templatePath)
-				} else {
-					loadedTemplates = append(loadedTemplates, parsed)
-				}
+	loadedTemplates := sliceutil.NewSyncSlice[*templates.Template]()
+
+	loadTemplate := func(tmpl *templates.Template) {
+		loadedTemplates.Append(tmpl)
+		// increment signed/unsigned counters
+		if tmpl.Verified {
+			if tmpl.TemplateVerifier == "" {
+				templates.SignatureStats[keys.PDVerifier].Add(1)
+			} else {
+				templates.SignatureStats[tmpl.TemplateVerifier].Add(1)
 			}
-		}
-		if err != nil {
-			if strings.Contains(err.Error(), templates.ErrExcluded.Error()) {
-				stats.Increment(templates.TemplatesExecutedStats)
-				if cfg.DefaultConfig.LogAllEvents {
-					gologger.Print().Msgf("[%v] %v\n", aurora.Yellow("WRN").String(), err.Error())
-				}
-				continue
-			}
-			gologger.Warning().Msg(err.Error())
+		} else {
+			templates.SignatureStats[templates.Unsigned].Add(1)
 		}
 	}
 
-	sort.SliceStable(loadedTemplates, func(i, j int) bool {
-		return loadedTemplates[i].Path < loadedTemplates[j].Path
+	var wgLoadTemplates sync.WaitGroup
+
+	for templatePath := range templatePathMap {
+		wgLoadTemplates.Add(1)
+		go func(templatePath string) {
+			defer wgLoadTemplates.Done()
+
+			loaded, err := store.config.ExecutorOptions.Parser.LoadTemplate(templatePath, store.tagFilter, tags, store.config.Catalog)
+			if loaded || store.pathFilter.MatchIncluded(templatePath) {
+				parsed, err := templates.Parse(templatePath, store.preprocessor, store.config.ExecutorOptions)
+				if err != nil {
+					// exclude templates not compatible with offline matching from total runtime warning stats
+					if !errors.Is(err, templates.ErrIncompatibleWithOfflineMatching) {
+						stats.Increment(templates.RuntimeWarningsStats)
+					}
+					gologger.Warning().Msgf("Could not parse template %s: %s\n", templatePath, err)
+				} else if parsed != nil {
+					if !parsed.Verified && store.config.ExecutorOptions.Options.DisableUnsignedTemplates {
+						// skip unverified templates when prompted to
+						stats.Increment(templates.SkippedUnsignedStats)
+						return
+					}
+
+					if parsed.SelfContained && !store.config.ExecutorOptions.Options.EnableSelfContainedTemplates {
+						stats.Increment(templates.ExcludedSelfContainedStats)
+						return
+					}
+
+					if parsed.HasFileProtocol() && !store.config.ExecutorOptions.Options.EnableFileTemplates {
+						stats.Increment(templates.ExcludedFileStats)
+						return
+					}
+
+					// if template has request signature like aws then only signed and verified templates are allowed
+					if parsed.UsesRequestSignature() && !parsed.Verified {
+						stats.Increment(templates.SkippedRequestSignatureStats)
+						return
+					}
+					// DAST only templates
+					// Skip DAST filter when loading auth templates
+					if store.ID() != AuthStoreId && store.config.ExecutorOptions.Options.DAST {
+						// check if the template is a DAST template
+						if parsed.IsFuzzing() {
+							loadTemplate(parsed)
+						}
+					} else if len(parsed.RequestsHeadless) > 0 && !store.config.ExecutorOptions.Options.Headless {
+						// donot include headless template in final list if headless flag is not set
+						stats.Increment(templates.ExcludedHeadlessTmplStats)
+						if config.DefaultConfig.LogAllEvents {
+							gologger.Print().Msgf("[%v] Headless flag is required for headless template '%s'.\n", aurora.Yellow("WRN").String(), templatePath)
+						}
+					} else if len(parsed.RequestsCode) > 0 && !store.config.ExecutorOptions.Options.EnableCodeTemplates {
+						// donot include 'Code' protocol custom template in final list if code flag is not set
+						stats.Increment(templates.ExcludedCodeTmplStats)
+						if config.DefaultConfig.LogAllEvents {
+							gologger.Print().Msgf("[%v] Code flag is required for code protocol template '%s'.\n", aurora.Yellow("WRN").String(), templatePath)
+						}
+					} else if len(parsed.RequestsCode) > 0 && !parsed.Verified && len(parsed.Workflows) == 0 {
+						// donot include unverified 'Code' protocol custom template in final list
+						stats.Increment(templates.SkippedCodeTmplTamperedStats)
+						// these will be skipped so increment skip counter
+						stats.Increment(templates.SkippedUnsignedStats)
+						if config.DefaultConfig.LogAllEvents {
+							gologger.Print().Msgf("[%v] Tampered/Unsigned template at %v.\n", aurora.Yellow("WRN").String(), templatePath)
+						}
+					} else if parsed.IsFuzzing() && !store.config.ExecutorOptions.Options.DAST {
+						stats.Increment(templates.ExludedDastTmplStats)
+						if config.DefaultConfig.LogAllEvents {
+							gologger.Print().Msgf("[%v] -dast flag is required for DAST template '%s'.\n", aurora.Yellow("WRN").String(), templatePath)
+						}
+					} else {
+						loadTemplate(parsed)
+					}
+				}
+			}
+			if err != nil {
+				if strings.Contains(err.Error(), templates.ErrExcluded.Error()) {
+					stats.Increment(templates.TemplatesExcludedStats)
+					if config.DefaultConfig.LogAllEvents {
+						gologger.Print().Msgf("[%v] %v\n", aurora.Yellow("WRN").String(), err.Error())
+					}
+					return
+				}
+				gologger.Warning().Msg(err.Error())
+			}
+		}(templatePath)
+	}
+
+	wgLoadTemplates.Wait()
+
+	sort.SliceStable(loadedTemplates.Slice, func(i, j int) bool {
+		return loadedTemplates.Slice[i].Path < loadedTemplates.Slice[j].Path
 	})
 
-	return loadedTemplates
+	return loadedTemplates.Slice
 }
 
 // IsHTTPBasedProtocolUsed returns true if http/headless protocol is being used for
